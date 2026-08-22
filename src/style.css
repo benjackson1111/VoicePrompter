@@ -1,0 +1,276 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Smooth scrolling */
+html {
+    scroll-behavior: smooth;
+}
+
+/* Hide scrollbar */
+.no-scrollbar::-webkit-scrollbar {
+    display: none;
+}
+
+.no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+}
+
+/* The Active Word - Full white by default (no orange highlight) */
+.current-word {
+    @apply inline-block transition-colors duration-100;
+}
+
+/* Active Word Highlight - Orange (when toggle is enabled) */
+.highlight-active-word .current-word {
+    @apply underline decoration-[3px] text-[#27e0ff] decoration-[#27e0ff];
+}
+
+/* Word Spacing Helper */
+.script-word {
+    display: inline-block;
+    margin-right: 0.6em;
+    margin-bottom: 0.2em;
+    cursor: pointer;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+/* Skippable words (inside brackets or emojis) */
+.skipped-word {
+    @apply italic opacity-50;
+}
+
+/* Stop Markers (Hidden by default, shown via class) */
+.stop-marker {
+    @apply hidden text-red-500 not-italic opacity-90;
+}
+
+/* Class added to parent to show stops */
+.show-stops .stop-marker {
+    display: inline-block;
+}
+
+/* Line Breaks (Paragraphs) */
+.line-break {
+    display: block;
+    width: 100%;
+    height: var(--paragraph-spacing, 1em);
+}
+
+/* Opacity Classes */
+
+/* Custom Range Slider Styling for Mobile */
+input[type=range] {
+    -webkit-appearance: none;
+    appearance: none;
+    /* Hides the slider so that custom slider can be made */
+    width: 100%;
+    /* Specific width is required for Firefox. */
+    background: transparent;
+    /* Otherwise white in Chrome */
+}
+
+input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 24px;
+    width: 24px;
+    border-radius: 50%;
+    background: #27e0ff;
+    /* blue-500 -> golden */
+    cursor: pointer;
+    margin-top: -8px;
+    /* You need to specify a margin in Chrome, but in Firefox and IE it is automatic */
+    box-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
+}
+
+input[type=range]::-moz-range-thumb {
+    height: 24px;
+    width: 24px;
+    border: none;
+    border-radius: 50%;
+    background: #27e0ff;
+    cursor: pointer;
+    box-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
+}
+
+input[type=range]::-webkit-slider-runnable-track {
+    width: 100%;
+    height: 8px;
+    cursor: pointer;
+    background: rgba(255,255,255,.14);
+    /* neutral-700 */
+    border-radius: 4px;
+}
+
+input[type=range]::-moz-range-track {
+    width: 100%;
+    height: 8px;
+    cursor: pointer;
+    background: rgba(255,255,255,.14);
+    border-radius: 4px;
+}
+
+.text-future {
+    @apply opacity-80;
+}
+
+.text-past {
+    @apply opacity-50;
+}
+
+/* Mirror Effect - Flip Horizontally + Rotate 180deg for Teleprompter Glass */
+.mirror-mode {
+    transform: scaleX(-1) rotate(180deg);
+}
+
+/* Horizontal Mirror (beta, ?beta=hmirror) - plain horizontal flip */
+.mirror-mode-h {
+    transform: scaleX(-1);
+}
+
+/* Both mirrors combined = vertical flip + horizontal flip = 180deg rotation */
+.mirror-mode.mirror-mode-h {
+    transform: rotate(180deg);
+}
+
+/* Screen Rotation - Rotate entire app 90deg clockwise for iOS */
+.screen-rotated {
+    transform: rotate(90deg);
+    transform-origin: center center;
+    width: 100vh;
+    height: 100vw;
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    margin-left: -50vh;
+    margin-top: -50vw;
+    overflow: auto;
+}
+
+
+
+/* Toggle Switch Styling */
+.toggle-checkbox:checked {
+    right: 0;
+    border-color: #27e0ff;
+}
+
+.toggle-checkbox:checked+.toggle-label {
+    background-color: #27e0ff;
+}
+
+/* Animations */
+@keyframes pulse-red {
+    0% {
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+    }
+
+    70% {
+        box-shadow: 0 0 0 10px rgba(239, 68, 68, 0);
+    }
+
+    100% {
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+    }
+}
+
+.recording-pulse {
+    animation: pulse-red 2s infinite;
+}
+
+/* Smooth Animations */
+.smooth-animations .current-word {
+    transition: none;
+    background-image: linear-gradient(to right, #27e0ff 50%, var(--base-color, #ffffff) 50%);
+    background-size: 200% 100%;
+    background-position: 100% 0;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: highlight-wipe 0.25s linear forwards;
+}
+
+@keyframes highlight-wipe {
+    0% {
+        background-position: 100% 0;
+    }
+
+    100% {
+        background-position: 0 0;
+    }
+}
+
+/* ═══════════════════════ Video Mode ═══════════════════════ */
+
+/* Video preview element */
+.video-preview {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1); /* Mirror for selfie cam */
+}
+
+#videoContainer {
+    touch-action: none;
+}
+
+/* ── Split Layout: script top, video bottom ── */
+.video-mode-split {
+    display: flex !important;
+    flex-direction: column;
+}
+
+.video-mode-split #scrollWrapper {
+    flex: 1;
+    height: auto !important;
+    min-height: 0;
+    position: relative;
+    z-index: 1;
+}
+
+.video-mode-split #videoContainer {
+    flex: 1;
+    position: relative;
+    min-height: 0;
+    border-top: 2px solid rgba(255, 255, 255, 0.1);
+}
+
+/* ── Overlay Layout: fullscreen video, script on top ── */
+.video-mode-overlay #videoContainer {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+}
+
+.video-mode-overlay #scrollWrapper {
+    position: relative;
+    z-index: 1;
+    height: 50% !important;
+    background: rgba(0, 0, 0, 0.65) !important;
+    backdrop-filter: blur(2px);
+}
+
+/* Recording active pulse on stop button */
+.video-recording-active {
+    animation: pulse-red 2s infinite;
+}
+
+/* Responsive - Landscape adjustments for video controls */
+@media (orientation: landscape) and (max-height: 500px) {
+    .video-mode-split {
+        flex-direction: row;
+    }
+
+    .video-mode-split #scrollWrapper {
+        width: 50%;
+    }
+
+    .video-mode-split #videoContainer {
+        width: 50%;
+        border-top: none;
+        border-left: 2px solid rgba(255, 255, 255, 0.1);
+    }
+}
