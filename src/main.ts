@@ -1052,7 +1052,17 @@ function initializeUI(): void {
     // Seed demo script for first-time users
     const history = getHistory();
     if (history.length === 0) {
-        const demoText = `Welcome to VoicePrompter - a completely free teleprompter that works right in the browser.\nThis text is scrolling automatically as you speak following your voice.\nSee the highlighted word? That's where you are in the script right now.\nIf you want to jump to a different part, just tap any word and it syncs instantly.\nYou can also use voice commands like go back, go next, go start, or go finish.\nThe app can also record video with the script overlaid, so you don't need any extra software.\nIn the settings you can adjust font size, margins, line and paragraph spacing, pick a color theme and more - I encourage you to explore the settings on your own and find the best ones for you.\nThe app supports 34 languages and detects them automatically.\nOne more thing - text in square brackets gets skipped automatically [like this]. Useful for notes or reminders to yourself.\nEverything runs on your device. Nothing is sent to any server. You can even save it to your home screen and use it completely offline.\n\nNow go make something great ;)`;
+        const demoText = `This is BiKi Prompter. Start talking and the script follows you.
+The highlighted word is where it thinks you are right now.
+Lost your place, or jumped ahead? Tap any word and it resyncs there.
+You can also say go back, go next, go start, or go finish.
+It records video with the script on top, so you don't need a second app running.
+Font size, margins, spacing and colours are all in settings - worth a pass before your first take.
+Anything in square brackets is skipped when read [like this], which is handy for stage directions.
+It detects the language automatically, across 34 of them.
+Nothing leaves this device. It works offline, and you can save it to your home screen.
+
+Right - go shoot something.`;
 
         // Save to localStorage with 'demo' tag
         const demoItem = {

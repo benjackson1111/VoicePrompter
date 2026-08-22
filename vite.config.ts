@@ -6,6 +6,13 @@ const BASE = '/prompter/'
 
 export default defineConfig({
     base: BASE,
+    build: {
+        // Emit straight into the website tree. Everything under
+        // "2026 website" is uploadable as-is; this project (and its
+        // node_modules) deliberately lives outside it.
+        outDir: '../2026 website/prompter',
+        emptyOutDir: true
+    },
     plugins: [
         VitePWA({
             registerType: 'autoUpdate',

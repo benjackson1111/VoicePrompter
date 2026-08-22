@@ -31,13 +31,32 @@ Using it commercially is fine; making it closed-source is not.
   temporal dead zone and aborted `boot()` partway. Flag now declared above its
   first caller.
 
+## Layout
+
+This project lives *outside* the website folder on purpose. Everything under
+`website/2026 website/` is uploadable to the server as-is; this directory holds
+the source and a 138 MB `node_modules` that the server must never see (and whose
+symlinks FTP clients can't transfer anyway).
+
+    website/
+      prompter-src/          <- this project (source, node_modules)
+      2026 website/
+        prompter/            <- build output ONLY. 304 KB, no symlinks.
+
 ## Develop
 
+    cd "website/prompter-src"
     npm install
-    npm run dev      # http://localhost:5180/prompter/
-    npm run build    # -> dist/
+    npm run dev              # http://localhost:5173/prompter/
+    npm run build            # writes ../2026 website/prompter/
 
-Deploy by copying `dist/` to `/prompter/` on the web host.
+## Deploy
+
+`npm run build`, then upload `2026 website/prompter/` with the rest of the site.
+No separate step, no exclusions to remember in Transmit.
+
+Note that `build` empties `2026 website/prompter/` first, so don't hand-edit
+anything in there - it gets wiped on the next build.
 
 ## Layout
 
