@@ -9,7 +9,7 @@ export const state: AppState = {
     isMirroredH: false,
     isScreenRotated: false,
     selectedLanguage: 'en-US', // Target language for SpeechRecognition
-    languageSetting: 'auto', // User's dropdown preference
+    languageSetting: 'en-US', // User's dropdown preference (default English, not auto-detect)
     detectedLanguage: null,
     config: {
         fontSize: 40,
