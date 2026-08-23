@@ -2,8 +2,17 @@ import { state } from './state';
 import { els } from './elements';
 import { updateMicUI, updateHighlight, scrollToCurrent, advancePastSkipped, restartScript, navigateParagraphs } from './render';
 
-// Track the last matched word to prevent matching the same word twice in a row
-let lastMatchedWord = '';
+// Script position consumed by the most recent match, so a repeated interim
+// result can't re-consume it. -1 means nothing matched yet.
+let lastMatchedIndex = -1;
+
+// The exact run of spoken words we last acted on. Recognition emits a result
+// while a phrase is still interim and again once it finalises, so the same
+// audio arrives more than once. Without this the second pass runs against a
+// cursor that has already moved past the right word, and matches the NEXT
+// occurrence instead - which is what made a word repeated across nearby
+// sentences drag you down the script.
+let lastConsumedTail = '';
 
 // Track which result indices we already processed for commands
 // to prevent re-firing when the recognition engine revisits finalized results
@@ -88,7 +97,8 @@ export function initSpeech(): void {
                             } else if (commandMatched === 'go back') {
                                 navigateParagraphs('back', 1);
                             }
-                            lastMatchedWord = '';
+                            lastMatchedIndex = -1;
+        lastConsumedTail = '';
                             return; // Stop processing to prevent the command from being read as script text
                         }
                     } else {
@@ -171,7 +181,8 @@ export function initSpeech(): void {
 export function startListening(): void {
     if (!state.recognition) return;
     state.isListening = true;
-    lastMatchedWord = '';
+    lastMatchedIndex = -1;
+    lastConsumedTail = '';
 
     speechBlocked = false;
     try {
@@ -187,7 +198,8 @@ export function startListening(): void {
 export function stopListening(): void {
     if (!state.recognition) return;
     state.isListening = false;
-    lastMatchedWord = '';
+    lastMatchedIndex = -1;
+    lastConsumedTail = '';
 
     try {
         state.recognition.stop();
@@ -197,23 +209,52 @@ export function stopListening(): void {
     }
 }
 
+function cleanToken(w: string): string {
+    return w.replace(/[^\p{L}\p{N}]/gu, "").toLowerCase();
+}
+
+// Previous script word that actually gets read aloud (skips bracketed notes).
+function prevReadableIndex(pos: number): number {
+    let p = pos - 1;
+    while (p >= 0 && state.scriptWords[p].skip) p--;
+    return p;
+}
+
+// How many of the most recently spoken words line up, in order, ending at
+// script position `pos`. 0 means `pos` wasn't the last thing said. This is what
+// tells two occurrences of the same word apart: "are right now" scores 3 at the
+// intended "now" and 1 at every other "now" in the script.
+function alignScore(pos: number, spoken: string[], max = 3): number {
+    let score = 0;
+    let sp = spoken.length - 1;
+    let wp = pos;
+
+    while (score < max && sp >= 0 && wp >= 0) {
+        if (state.scriptWords[wp].clean !== spoken[sp]) break;
+        score++;
+        sp--;
+        wp = prevReadableIndex(wp);
+    }
+    return score;
+}
+
 function matchWords(spokenWords: string[]) {
     if (state.currentIndex >= state.scriptWords.length) return;
-    if (spokenWords.length === 0) return;
+
+    // Order matters here, so keep the sequence rather than building a Set.
+    const spoken = spokenWords.map(cleanToken).filter(w => w.length > 0);
+    if (spoken.length === 0) return;
+
+    // Same audio as last time? We've already advanced on it; acting again would
+    // hunt forward for a second copy of the same words.
+    const tail = spoken.join(' ');
+    if (tail === lastConsumedTail) return;
+    lastConsumedTail = tail;
 
     const LOOKAHEAD = state.config.lookaheadWords;
 
-    // Create a Set of cleaned spoken words for fast lookup
-    const spokenSet = new Set(
-        spokenWords
-            .map(w => w.replace(/[^\p{L}\p{N}]/gu, "").toLowerCase())
-            .filter(w => w.length > 0)
-    );
-
-    if (spokenSet.size === 0) return;
-
-    // Iterate through SCRIPT words from nearest to farthest
-    // This ensures we always advance to the nearest matching word
+    let bestPos = -1;
+    let bestScore = 0;
     let scriptPtr = state.currentIndex;
     let validWordsChecked = 0;
 
@@ -225,27 +266,32 @@ function matchWords(spokenWords: string[]) {
             continue;
         }
 
-        // Check if this script word was spoken
-        if (spokenSet.has(scriptWordObj.clean)) {
-            // Prevent matching the same word twice in a row (prevents double-jump)
-            // But allow it if it's at the current position (position 0 in lookahead)
-            if (scriptWordObj.clean === lastMatchedWord && validWordsChecked > 0) {
-                // Same word as last match, and not at current position - skip it
-                scriptPtr++;
-                validWordsChecked++;
-                continue;
-            }
+        if (scriptPtr !== lastMatchedIndex) {
+            const score = alignScore(scriptPtr, spoken);
 
-            lastMatchedWord = scriptWordObj.clean;
-            state.currentIndex = scriptPtr + 1;
-            advancePastSkipped();
-            updateHighlight();
-            scrollToCurrent();
-            return;
+            // A bare single-word match may only carry you to the very next
+            // word. Landing anywhere further ahead needs a second word of
+            // context — that's what stops a word repeated across nearby
+            // sentences from dragging you down the script, and it also stops
+            // a repeated interim result double-jumping.
+            const allowed = score >= 2 || (score === 1 && validWordsChecked === 0);
+
+            // Strictly greater, so an equal score keeps the NEAREST position.
+            if (allowed && score > bestScore) {
+                bestScore = score;
+                bestPos = scriptPtr;
+            }
         }
 
         scriptPtr++;
         validWordsChecked++;
     }
-}
 
+    if (bestPos < 0) return;
+
+    lastMatchedIndex = bestPos;
+    state.currentIndex = bestPos + 1;
+    advancePastSkipped();
+    updateHighlight();
+    scrollToCurrent();
+}
