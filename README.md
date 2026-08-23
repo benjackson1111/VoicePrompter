@@ -26,10 +26,27 @@ Using it commercially is fine; making it closed-source is not.
   session recorder that captured DOM interactions).
 - Rebased onto `/prompter/`: Vite `base`, PWA `start_url` and `scope`.
 - Rebranded titles, headings and OG/canonical metadata.
-- Fixed an upstream crash: `dockPinned` was a `let` declared below the hoisted
-  `pinDockToVisualViewport()`, so the `boot()` call during module eval hit its
-  temporal dead zone and aborted `boot()` partway. Flag now declared above its
-  first caller.
+### Two upstream bugs fixed
+
+Both of these are faults in upstream's code, not things we introduced. They'd
+be worth offering back to kosuvorov as pull requests.
+
+**`boot()` aborted on every page load.** `dockPinned` was a `let` declared
+below the hoisted `pinDockToVisualViewport()`, so the `boot()` call during
+module eval hit its temporal dead zone and threw. That killed the rest of
+`boot()`, including the history re-render the comment above it was added to
+guarantee. Flag now declared above its first caller.
+
+**A repeated word dragged the cursor down the script.** Reading a script where
+the same word recurs across nearby sentences, the highlight would skip the
+occurrence being read and land on a later one. The cause is duplicate
+processing: recognition emits a result while a phrase is interim and again once
+it finalises, so identical audio arrives twice, and by the second pass the
+cursor has moved past the correct match. Fixed by recording the run of words
+each match consumed and ignoring an identical repeat. Simulated over five
+repetition-heavy scripts at 1-3 results per word, divergences went from 62 to 0.
+
+Note this is simulated, not measured against real speech.
 
 ## Layout
 
