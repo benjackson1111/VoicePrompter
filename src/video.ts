@@ -30,8 +30,15 @@ function applyCameraMirror(): void {
 // portrait. iOS evidently reads these sizes in the camera sensor's own frame,
 // and which request yields an upright portrait preview isn't something we can
 // know in advance - so on phones we try them in turn (see startCamera).
+//
+// Ben's iPhone log then showed the rule: the preview gets the TRANSPOSE of
+// what the camera reports. Asked portrait -> camera says 720x1280, preview
+// gets 1280x720 (sideways). Asked nothing -> 640x480, preview 480x640
+// (upright, but VGA). So asking landscape 1280x720 should give an upright
+// 720x1280 preview - HD. Try that first; low-res only as a last resort.
 type SizeAsk = 'portrait' | 'landscape' | 'none';
-const ASK_ORDER: SizeAsk[] = ['portrait', 'none', 'landscape', 'landscape'];
+const ASK_ORDER: SizeAsk[] = ['landscape', 'landscape', 'portrait', 'none'];
+const HD_SHORT_SIDE = 720;
 
 function buildConstraints(ask: SizeAsk): MediaStreamConstraints {
     const video: any = {};
@@ -136,9 +143,13 @@ async function startCamera(): Promise<MediaStream> {
     }
 
     const want = wantPortrait();
-    const key = `biki-camera-ask:${state.facingMode}:${want ? 'portrait' : 'landscape'}`;
+    const key = `biki-camera-ask-v2:${state.facingMode}:${want ? 'portrait' : 'landscape'}`;
     const order = askOrder(key);
+    const remembered = rememberedAsk(key);
     let stream: MediaStream | null = null;
+    let lowRes: SizeAsk | null = null;      // upright but below HD - kept as a fallback
+    let lastAsk: SizeAsk | null = null;
+    let lastUpright = false;
 
     for (let i = 0; i < order.length; i++) {
         if (stream) {
@@ -148,13 +159,32 @@ async function startCamera(): Promise<MediaStream> {
         stream = await navigator.mediaDevices.getUserMedia(buildConstraints(order[i]));
         describeStream(stream, `try ${i + 1}/${order.length} asked ${order[i]}, camera says`);
         const f = await attachToPreview(stream);
-        const ok = f.w > 0 && f.h > 0 && (f.h > f.w) === want;
-        dlog(`camera: try ${i + 1} -> preview gets ${f.w}x${f.h} ${ok ? 'RIGHT WAY UP' : '(wrong shape)'}`);
-        if (ok) {
+        const upright = f.w > 0 && f.h > 0 && (f.h > f.w) === want;
+        const hd = Math.min(f.w, f.h) >= HD_SHORT_SIDE;
+        dlog(`camera: try ${i + 1} -> preview gets ${f.w}x${f.h} ` +
+            (upright ? (hd ? 'RIGHT WAY UP, HD' : 'right way up but LOW-RES') : '(wrong shape)'));
+        lastAsk = order[i];
+        lastUpright = upright;
+        // Accept HD; or what this phone settled on last time, even if low-res,
+        // rather than hunting for HD again on every camera-on.
+        if (upright && (hd || order[i] === remembered)) {
             rememberAsk(key, order[i]);
             return stream;
         }
+        if (upright && !lowRes) lowRes = order[i];
         if (!f.w) return stream;   // no frames to judge by - don't churn the camera
+    }
+
+    if (lowRes) {
+        rememberAsk(key, lowRes);
+        if (lastAsk === lowRes && lastUpright) return stream!;
+        dlog(`camera: no HD option came out upright - going back to "${lowRes}" (low-res)`);
+        stream!.getTracks().forEach(t => t.stop());
+        await sleep(300);
+        stream = await navigator.mediaDevices.getUserMedia(buildConstraints(lowRes));
+        describeStream(stream, 'fallback, camera says');
+        await attachToPreview(stream);
+        return stream;
     }
     dlog('camera: no way of asking gave a right-way-up preview');
     return stream!;
