@@ -151,6 +151,14 @@
         </div>
     </div>
 
+    <!-- Status Toast (mic / camera / permission problems) -->
+    <div id="statusToast" class="hidden fixed top-4 inset-x-0 flex justify-center z-[10002] pointer-events-none px-4">
+        <div id="statusToastCard"
+            class="max-w-sm w-full px-4 py-3 bg-neutral-900 border border-[#27e0ff]/40 rounded-xl shadow-2xl shadow-black/50">
+            <p id="statusToastText" class="text-sm text-neutral-200 leading-snug"></p>
+        </div>
+    </div>
+
     <!-- Language Detection Warning Toast -->
     <div id="langDetectionWarning"
         class="hidden fixed inset-0 flex items-center justify-center z-[10001] pointer-events-none">

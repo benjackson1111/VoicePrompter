@@ -48,6 +48,15 @@ repetition-heavy scripts at 1-3 results per word, divergences went from 62 to 0.
 
 Note this is simulated, not measured against real speech.
 
+## Diagnosing mic / camera problems
+
+Open the app with `?debug` on the end of the URL (`/prompter/?debug`). A small
+log in the bottom-left corner then shows what the speech engine, camera and
+recorder are doing - engines starting, ending, erroring and being replaced,
+the camera frame size, and whether the mic track is live or muted. Safari's
+failures are otherwise silent, so a screenshot of that log is the fastest way
+to pin down a problem.
+
 ## Layout
 
 This project lives *outside* the website folder on purpose. Everything under

@@ -7,7 +7,8 @@ import { initSpeech, startListening, stopListening } from './speech';
 import { autoScrollManager } from './autoscroll';
 import { saveToHistory, getHistory, clearAllHistory } from './storage';
 import { ScriptWord, ScrollingMode } from './types';
-import { enterVideoMode, exitVideoMode, toggleVideoLayout, startRecording, stopRecording, flipCamera, getMediaConstraints } from './video';
+import { enterVideoMode, exitVideoMode, toggleVideoLayout, startRecording, stopRecording, flipCamera, getMediaConstraints, isVideoStreamLive } from './video';
+import { exposeForDebug, dlog } from './debug';
 import { detectAll } from 'tinyld/light';
 import { fetchGoogleDocText } from './gdoc';
 import { enumerateAndPopulateDevices } from './devices';
@@ -209,6 +210,15 @@ function updateAutoDetectText(detectedVal: string | null) {
 // --- PWA Update Handling ---
 registerSW({ immediate: true });
 
+// Release camera + mic when the page is actually going away, so nothing is
+// left holding them for the next visit.
+window.addEventListener('pagehide', () => {
+    if (state.isVideoMode || state.mediaStream) exitVideoMode();
+    dlog('page: hidden/unloading - released camera');
+});
+
+exposeForDebug({ state, startListening, stopListening, enterVideoMode, exitVideoMode, startRecording, stopRecording });
+
 // --- Initialization ---
 initElements();
 initSpeech();
@@ -322,6 +332,11 @@ function loadScript(text: string, googleDocUrl: string | null = null): void {
 
 function resetApp(): void {
     stopListening();
+    // Upstream never released the camera here, so going back to the editor
+    // left camera + mic running invisibly and the app still believing camera
+    // mode was on - the next tap on the camera button turned it OFF, and the
+    // orphaned mic capture fought speech recognition on the next script.
+    if (state.isVideoMode || state.mediaStream) exitVideoMode();
     autoScrollManager.stop();
     isAutoScrollStarting = false;
     unlockBodyScroll();
@@ -977,9 +992,12 @@ els.dismissAndroidVideoWarningBtn.addEventListener('click', () => {
 
 // Toggle Video Mode
 els.videoModeBtn.addEventListener('click', async () => {
-    if (state.isVideoMode) {
+    // Trust the camera, not the flag: if camera mode is "on" but the stream
+    // has died (system interruption), this tap should turn it back on.
+    if (state.isVideoMode && isVideoStreamLive()) {
         exitVideoMode();
     } else {
+        if (state.isVideoMode) exitVideoMode();
         const originalContent = els.videoModeBtn.innerHTML;
         (els.videoModeBtn as HTMLButtonElement).disabled = true;
         els.videoModeBtn.innerHTML = `<svg class="animate-spin h-6 w-6 text-neutral-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">

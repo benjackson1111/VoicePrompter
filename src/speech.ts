@@ -1,6 +1,8 @@
 import { state } from './state';
 import { els } from './elements';
 import { updateMicUI, updateHighlight, scrollToCurrent, advancePastSkipped, restartScript, navigateParagraphs } from './render';
+import { dlog } from './debug';
+import { showStatus } from './status';
 
 // Script position consumed by the most recent match, so a repeated interim
 // result can't re-consume it. -1 means nothing matched yet.
@@ -14,95 +16,284 @@ let lastMatchedIndex = -1;
 // sentences drag you down the script.
 let lastConsumedTail = '';
 
-// Track which result indices we already processed for commands
-// to prevent re-firing when the recognition engine revisits finalized results
-
-let speechBlocked = false;
-
 // Voice command arming to prevent duplicate triggers
 let commandArmed = true;
 
-// Arc / silent-fail detection
+// Arc / silent-fail detection (only meaningful for the very first start)
 let isFirstStart = true;
 let gotResultOnFirstStart = false;
+
+// ── Engine lifecycle ─────────────────────────────────────────────────────
+// `state.isListening` is the user's INTENT ("I want it listening"). The
+// SpeechRecognition object is the ENGINE, which Safari stops, interrupts
+// (e.g. when the camera grabs the mic) and occasionally wedges entirely.
+//
+// Upstream used one engine for the life of the page and treated most failures
+// as either "stop for good" or "log and restart the same object instantly".
+// A wedged engine then stayed wedged until the page was reloaded - which is
+// why force-quitting Safari before every take was the only reliable fix.
+// Here a failed engine is thrown away and replaced, with backoff, and the user
+// is told if it can't be brought back.
+let engineRunning = false;          // between start() and its end event
+let runHadResult = false;
+let runError: string | null = null;
+let runStartedAt = 0;
+let consecutiveFailures = 0;
+let restartTimer: ReturnType<typeof setTimeout> | null = null;
+let startWatchdog: ReturnType<typeof setTimeout> | null = null;
+
+const MAX_FAILURES = 6;
+const START_TIMEOUT_MS = 5000;
+
+// Errors that mean "this browser/session can't do speech at all" are handled
+// separately; these are the ones that are fine on a very first start.
+const FIRST_START_OK = ['not-allowed', 'service-not-allowed', 'audio-capture', 'aborted', 'no-speech'];
+
+function getCtor(): any {
+    return (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+}
+
+function voiceWanted(): boolean {
+    return state.isListening && state.config.scrollingMode === 'voice';
+}
 
 function showBrowserWarning() {
     els.browserWarning.classList.remove('hidden');
 }
 
-export function initSpeech(): void {
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+function isIPadPWA(): boolean {
+    const isIPad = navigator.userAgent.includes('iPad') || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 2);
+    const isPWA = (window.navigator as any).standalone === true || window.matchMedia('(display-mode: standalone)').matches;
+    return isIPad && isPWA;
+}
 
-    if (!SpeechRecognition) {
-        // No API at all — Firefox, older browsers
-        showBrowserWarning();
+function clearTimers(): void {
+    if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+    if (startWatchdog) { clearTimeout(startWatchdog); startWatchdog = null; }
+}
+
+// Detach and kill the current engine. Its late events can no longer reach us.
+function disposeRecognizer(): void {
+    const rec = state.recognition;
+    if (!rec) return;
+    rec.onstart = null;
+    rec.onresult = null;
+    rec.onerror = null;
+    rec.onend = null;
+    try { rec.abort(); } catch { /* already stopped */ }
+    state.recognition = null;
+    engineRunning = false;
+}
+
+function createRecognizer(): boolean {
+    const Ctor = getCtor();
+    if (!Ctor) return false;
+    disposeRecognizer();
+    const rec = new Ctor();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = state.selectedLanguage;
+    rec.onstart = handleStart;
+    rec.onresult = handleResult;
+    rec.onerror = handleError;
+    rec.onend = handleEnd;
+    state.recognition = rec;
+    dlog(`speech: new engine (${rec.lang})`);
+    return true;
+}
+
+function engineStart(): void {
+    if (!state.recognition && !createRecognizer()) return;
+    runHadResult = false;
+    runError = null;
+    runStartedAt = Date.now();
+    try {
+        state.recognition.start();
+        engineRunning = true;
+    } catch (err: any) {
+        // Safari throws InvalidStateError when it believes a previous session
+        // is still running - the classic wedge. A fresh engine clears it.
+        dlog(`speech: start() threw ${err?.name || err} - replacing engine`);
+        if (!createRecognizer()) return;
+        try {
+            state.recognition.start();
+            engineRunning = true;
+        } catch (err2: any) {
+            dlog(`speech: fresh engine also threw ${err2?.name || err2}`);
+            consecutiveFailures++;
+            scheduleRecovery();
+            return;
+        }
+    }
+    if (startWatchdog) clearTimeout(startWatchdog);
+    startWatchdog = setTimeout(() => {
+        startWatchdog = null;
+        // start() returned but the engine never actually began - wedged.
+        if (voiceWanted() && engineRunning) {
+            dlog('speech: engine never started - replacing it');
+            consecutiveFailures++;
+            disposeRecognizer();
+            scheduleRecovery();
+        }
+    }, START_TIMEOUT_MS);
+}
+
+function scheduleRestart(delayMs: number, fresh: boolean): void {
+    if (restartTimer) clearTimeout(restartTimer);
+    restartTimer = setTimeout(() => {
+        restartTimer = null;
+        if (!voiceWanted()) return;
+        if (fresh) createRecognizer();
+        engineStart();
+    }, delayMs);
+}
+
+function scheduleRecovery(): void {
+    if (consecutiveFailures > MAX_FAILURES) {
+        hardStop('Lost the microphone and couldn\'t get it back. Tap the mic to try again.');
+        return;
+    }
+    if (consecutiveFailures >= 2) {
+        showStatus('Microphone dropped out - reconnecting...', 'warn', 2500);
+    }
+    const delay = Math.min(4000, 250 * 2 ** Math.max(0, consecutiveFailures - 1));
+    dlog(`speech: recovering in ${delay}ms (failure ${consecutiveFailures})`);
+    scheduleRestart(delay, true);
+}
+
+function hardStop(message: string | null): void {
+    state.isListening = false;
+    clearTimers();
+    disposeRecognizer();
+    updateMicUI(false);
+    if (message) showStatus(message, 'error', 8000);
+    dlog(`speech: stopped${message ? ' - ' + message : ''}`);
+}
+
+function handleStart(): void {
+    if (startWatchdog) { clearTimeout(startWatchdog); startWatchdog = null; }
+    dlog('speech: listening');
+}
+
+function handleError(e: any): void {
+    const code: string = e?.error || 'unknown';
+    runError = code;
+    dlog(`speech: error "${code}"`);
+
+    if (code === 'not-allowed' || code === 'service-not-allowed') {
+        hardStop('Speech recognition is blocked for this site. Allow the microphone (and Speech Recognition) in your browser settings, then tap the mic.');
         return;
     }
 
-    state.recognition = new SpeechRecognition();
-    state.recognition.continuous = true;
-    state.recognition.interimResults = true;
-    state.recognition.lang = state.selectedLanguage;
+    // Arc / silent-fail detection: an unusual error on the very first start
+    // means this browser has the API but no working speech service.
+    if (isFirstStart && !gotResultOnFirstStart && !FIRST_START_OK.includes(code)) {
+        isFirstStart = false;
+        showBrowserWarning();
+        hardStop(null);
+        return;
+    }
 
-    state.recognition.onresult = (event: any) => {
-        // Mark that we got real results on first start (rules out Arc silent fail)
-        if (isFirstStart) {
-            gotResultOnFirstStart = true;
+    if (code === 'aborted' && isIPadPWA()) {
+        // iPadOS blocks recognition inside Home Screen apps entirely.
+        els.ipadPwaWarning.classList.remove('hidden');
+        hardStop(null);
+        return;
+    }
+
+    // Everything else ('aborted', 'audio-capture', 'network', ...) is handled
+    // in handleEnd, which replaces the engine.
+}
+
+function handleEnd(): void {
+    engineRunning = false;
+    if (startWatchdog) { clearTimeout(startWatchdog); startWatchdog = null; }
+    const ranFor = Date.now() - runStartedAt;
+    dlog(`speech: ended after ${ranFor}ms (results: ${runHadResult ? 'yes' : 'no'}${runError ? ', error: ' + runError : ''})`);
+
+    if (isFirstStart) {
+        isFirstStart = false;
+        // Arc / silent-fail detection: ended immediately with nothing at all.
+        if (!gotResultOnFirstStart && !runError && ranFor < 1500) {
+            showBrowserWarning();
+            hardStop(null);
+            return;
         }
+    }
 
-        let transcript = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-            transcript += event.results[i][0].transcript;
-        }
+    if (!voiceWanted()) {
+        if (!state.isListening) updateMicUI(false);
+        return;
+    }
 
-        // --- Voice Commands (Mac-Style) ---
-        if (state.config.voiceCommandsEnabled) {
-            const cleanTokens = transcript.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(t => t.length > 0);
-            if (cleanTokens.length >= 2) {
-                const lastTwoWords = cleanTokens.slice(-2).join(' ');
-                let commandMatched: string | null = null;
+    const failed = (runError !== null && runError !== 'no-speech') || (!runHadResult && ranFor < 1000);
+    if (failed) {
+        consecutiveFailures++;
+        scheduleRecovery();
+    } else {
+        // Normal: Safari ends continuous sessions on its own every so often.
+        scheduleRestart(150, false);
+    }
+}
+
+function handleResult(event: any): void {
+    if (isFirstStart) {
+        gotResultOnFirstStart = true;
+    }
+    runHadResult = true;
+    consecutiveFailures = 0;
+
+
+    let transcript = '';
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+        transcript += event.results[i][0].transcript;
+    }
+
+    // --- Voice Commands (Mac-Style) ---
+    if (state.config.voiceCommandsEnabled) {
+        const cleanTokens = transcript.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(t => t.length > 0);
+        if (cleanTokens.length >= 2) {
+            const lastTwoWords = cleanTokens.slice(-2).join(' ');
+            let commandMatched: string | null = null;
+            
+            if (lastTwoWords === 'go start') commandMatched = 'go start';
+            else if (lastTwoWords === 'go finish') commandMatched = 'go finish';
+            else if (lastTwoWords === 'go next') commandMatched = 'go next';
+            else if (lastTwoWords === 'go back') commandMatched = 'go back';
+            
+            if (commandMatched) {
+                const commandTokens = commandMatched.split(' ');
+                // Conflict resolution: look around the current index (back 4, forward 10)
+                const startIdx = Math.max(0, state.currentIndex - 4);
+                const endIdx = Math.min(state.scriptWords.length, state.currentIndex + 10);
+                const windowScript = state.scriptWords.slice(startIdx, endIdx).map(w => w.word.toLowerCase().replace(/[^\w\s]/g, ''));
                 
-                if (lastTwoWords === 'go start') commandMatched = 'go start';
-                else if (lastTwoWords === 'go finish') commandMatched = 'go finish';
-                else if (lastTwoWords === 'go next') commandMatched = 'go next';
-                else if (lastTwoWords === 'go back') commandMatched = 'go back';
-                
-                if (commandMatched) {
-                    const commandTokens = commandMatched.split(' ');
-                    // Conflict resolution: look around the current index (back 4, forward 10)
-                    const startIdx = Math.max(0, state.currentIndex - 4);
-                    const endIdx = Math.min(state.scriptWords.length, state.currentIndex + 10);
-                    const windowScript = state.scriptWords.slice(startIdx, endIdx).map(w => w.word.toLowerCase().replace(/[^\w\s]/g, ''));
-                    
-                    let conflict = false;
-                    for (let j = 0; j < Math.max(0, windowScript.length - 1); j++) {
-                        if (windowScript[j] === commandTokens[0] && windowScript[j+1] === commandTokens[1]) {
-                            conflict = true;
-                            break;
-                        }
+                let conflict = false;
+                for (let j = 0; j < Math.max(0, windowScript.length - 1); j++) {
+                    if (windowScript[j] === commandTokens[0] && windowScript[j+1] === commandTokens[1]) {
+                        conflict = true;
+                        break;
                     }
-                    
-                    if (!conflict) {
-                        if (commandArmed) {
-                            commandArmed = false;
-                            console.log(`[VoiceCommand] TRIGGER: ${commandMatched}`);
-                            if (commandMatched === 'go start') {
-                                restartScript();
-                            } else if (commandMatched === 'go finish') {
-                                state.currentIndex = Math.max(0, state.scriptWords.length - 1);
-                                updateHighlight();
-                                scrollToCurrent();
-                            } else if (commandMatched === 'go next') {
-                                navigateParagraphs('forward', 1);
-                            } else if (commandMatched === 'go back') {
-                                navigateParagraphs('back', 1);
-                            }
-                            lastMatchedIndex = -1;
-        lastConsumedTail = '';
-                            return; // Stop processing to prevent the command from being read as script text
+                }
+                
+                if (!conflict) {
+                    if (commandArmed) {
+                        commandArmed = false;
+                        console.log(`[VoiceCommand] TRIGGER: ${commandMatched}`);
+                        if (commandMatched === 'go start') {
+                            restartScript();
+                        } else if (commandMatched === 'go finish') {
+                            state.currentIndex = Math.max(0, state.scriptWords.length - 1);
+                            updateHighlight();
+                            scrollToCurrent();
+                        } else if (commandMatched === 'go next') {
+                            navigateParagraphs('forward', 1);
+                        } else if (commandMatched === 'go back') {
+                            navigateParagraphs('back', 1);
                         }
-                    } else {
-                        commandArmed = true;
+                        lastMatchedIndex = -1;
+    lastConsumedTail = '';
+                        return; // Stop processing to prevent the command from being read as script text
                     }
                 } else {
                     commandArmed = true;
@@ -110,102 +301,96 @@ export function initSpeech(): void {
             } else {
                 commandArmed = true;
             }
-        }
-
-        // --- Word matching: uses all results (interim + final) for responsiveness ---
-        const spokenWords = transcript.trim().toLowerCase().split(/\s+/);
-        matchWords(spokenWords.slice(-5));
-    };
-
-    state.recognition.onerror = (e: any) => {
-        console.log('error:', e.error, e.message);
-
-        // Arc / silent-fail detection: error fires immediately on first start with no results
-        if (isFirstStart && !gotResultOnFirstStart) {
-            isFirstStart = false;
-            if (e.error === 'not-allowed' || e.error === 'service-not-allowed' || e.error === 'audio-capture' || e.error === 'aborted') {
-                // These are legitimate errors that don't mean the browser lacks support
-                // 'aborted' happens on Safari iOS when the permission dialog interrupts the first recognition start
-            } else {
-                showBrowserWarning();
-            }
-            state.isListening = false;
-            updateMicUI(false);
-            return;
-        }
-
-        if (e.error === 'aborted') {
-            speechBlocked = true;
-
-            // Modern iPad detection
-            const isIPad = navigator.userAgent.includes('iPad') || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 2);
-            const isPWA = (window.navigator as any).standalone === true || window.matchMedia('(display-mode: standalone)').matches;
-
-            if (isIPad && isPWA) {
-                els.ipadPwaWarning.classList.remove('hidden');
-            }
-
-            state.isListening = false;
-            updateMicUI(false);
-            return;
-        }
-    };
-
-    state.recognition.onend = () => {
-        console.log('ended');
-
-        // Arc / silent-fail detection: ended immediately on first start with no results and no error
-        if (isFirstStart && !gotResultOnFirstStart) {
-            isFirstStart = false;
-            showBrowserWarning();
-            state.isListening = false;
-            updateMicUI(false);
-            return;
-        }
-        isFirstStart = false;
-
-        if (speechBlocked) return;
-        if (state.isListening) {
-
-            try {
-                state.recognition.start();
-            } catch (error) {
-                console.error('Failed to restart speech recognition:', error);
-            }
         } else {
-            updateMicUI(false);
+            commandArmed = true;
         }
-    };
+    }
+
+    // --- Word matching: uses all results (interim + final) for responsiveness ---
+    const spokenWords = transcript.trim().toLowerCase().split(/\s+/);
+    matchWords(spokenWords.slice(-5));
+}
+
+export function initSpeech(): void {
+    if (!getCtor()) {
+        // No API at all — Firefox, older browsers
+        showBrowserWarning();
+        return;
+    }
+    createRecognizer();
+
+    // Safari kills recognition when the page is backgrounded (app switch,
+    // screen lock, a call). Drop the dead engine on the way out and start a
+    // fresh one on the way back, instead of leaving a zombie behind.
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            if (voiceWanted()) {
+                clearTimers();
+                disposeRecognizer();
+                dlog('speech: paused (page hidden)');
+            }
+        } else if (voiceWanted() && !engineRunning && !restartTimer) {
+            dlog('speech: resuming (page visible)');
+            consecutiveFailures = 0;
+            createRecognizer();
+            engineStart();
+        }
+    });
 }
 
 export function startListening(): void {
-    if (!state.recognition) return;
+    if (!getCtor()) return;
     state.isListening = true;
     lastMatchedIndex = -1;
     lastConsumedTail = '';
-
-    speechBlocked = false;
-    try {
-        state.recognition.start();
-        updateMicUI(true);
-    } catch (error) {
-        console.error('Failed to start speech recognition:', error);
-        state.isListening = false;
-        updateMicUI(false);
-    }
+    consecutiveFailures = 0;
+    clearTimers();
+    updateMicUI(true);
+    // Reuse a healthy idle engine; replace anything that's mid-session or gone.
+    if (!state.recognition || engineRunning) createRecognizer();
+    engineStart();
 }
 
 export function stopListening(): void {
-    if (!state.recognition) return;
     state.isListening = false;
     lastMatchedIndex = -1;
     lastConsumedTail = '';
+    clearTimers();
+    if (state.recognition) {
+        try {
+            state.recognition.stop();
+        } catch (error) {
+            console.error('Failed to stop speech recognition:', error);
+        }
+    }
+    updateMicUI(false);
+}
 
+// Run `fn` (which grabs the camera/mic) with speech recognition paused, then
+// bring recognition back on a fresh engine. Requesting the camera while
+// recognition is live makes Safari abort recognition; upstream treated that
+// abort as "stop listening for good", so the prompter went deaf the moment
+// the camera came on. Doing it in this order keeps both working.
+export async function withRecognitionPaused<T>(fn: () => Promise<T>): Promise<T> {
+    const resume = voiceWanted();
+    if (resume) {
+        clearTimers();
+        disposeRecognizer();
+        dlog('speech: paused while the camera starts');
+    }
     try {
-        state.recognition.stop();
-        updateMicUI(false);
-    } catch (error) {
-        console.error('Failed to stop speech recognition:', error);
+        return await fn();
+    } finally {
+        if (resume && voiceWanted()) {
+            // Let the new capture settle before speech asks for the mic.
+            await new Promise(r => setTimeout(r, 300));
+            if (voiceWanted() && !engineRunning) {
+                consecutiveFailures = 0;
+                createRecognizer();
+                engineStart();
+                dlog('speech: resumed after camera');
+            }
+        }
     }
 }
 

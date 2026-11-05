@@ -1,6 +1,18 @@
 import { state } from './state';
 import { els } from './elements';
 import { scrollToCurrent } from './render';
+import { withRecognitionPaused } from './speech';
+import { dlog } from './debug';
+import { showStatus } from './status';
+
+const isMobile = /iPad|iPhone|iPod|Android/i.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+// Phones and tablets should record the way they're being held. Desktop
+// webcams are landscape-only, so they always get landscape.
+function wantPortrait(): boolean {
+    return isMobile && window.matchMedia('(orientation: portrait)').matches;
+}
 
 // Mirror the preview only for the front ('user') camera, like a selfie view.
 // The rear camera should show a true (non-mirrored) image.
@@ -9,10 +21,12 @@ function applyCameraMirror(): void {
         state.facingMode === 'user' ? 'scaleX(-1)' : 'none';
 }
 
-export function getMediaConstraints(): MediaStreamConstraints {
+export function getMediaConstraints(portrait = wantPortrait()): MediaStreamConstraints {
+    // Upstream always asked for 1280x720 - landscape - so a phone held upright
+    // still got a widescreen frame.
     const videoConstraints: any = {
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
+        width: { ideal: portrait ? 720 : 1280 },
+        height: { ideal: portrait ? 1280 : 720 }
     };
     
     if (state.selectedVideoDeviceId) {
@@ -31,13 +45,86 @@ export function getMediaConstraints(): MediaStreamConstraints {
     };
 }
 
+function streamIsPortrait(stream: MediaStream): boolean | null {
+    const s = stream.getVideoTracks()[0]?.getSettings();
+    if (!s || !s.width || !s.height) return null;
+    return s.height > s.width;
+}
+
+function describeStream(stream: MediaStream, label: string): void {
+    const v = stream.getVideoTracks()[0];
+    const a = stream.getAudioTracks()[0];
+    const vs = v?.getSettings();
+    dlog(`camera: ${label} ${vs?.width}x${vs?.height} ${vs?.facingMode || ''} | ` +
+        (a ? `mic ${a.readyState}${a.muted ? ' MUTED' : ''}` : 'no mic track'));
+}
+
+// Get a camera+mic stream whose frame matches how the device is held.
+//
+// iOS doesn't reliably honour the requested shape on the first request
+// (turning the camera off and on again was fixing it by hand), and versions
+// differ on whether width/height are read in the screen's frame or the
+// sensor's. So check what actually came back, and if it's the wrong shape ask
+// again - first the same way, then the other way round.
+async function acquireStream(): Promise<MediaStream> {
+    const portrait = wantPortrait();
+    let stream = await navigator.mediaDevices.getUserMedia(getMediaConstraints(portrait));
+    describeStream(stream, 'got');
+
+    if (isMobile && !state.selectedVideoDeviceId) {
+        for (const ask of [portrait, !portrait]) {
+            if (streamIsPortrait(stream) !== !portrait) break;   // right shape (or unknown)
+            dlog(`camera: wrong shape for a ${portrait ? 'portrait' : 'landscape'} device, asking again`);
+            stream.getTracks().forEach(t => t.stop());
+            stream = await navigator.mediaDevices.getUserMedia(getMediaConstraints(ask));
+            describeStream(stream, 'retry');
+        }
+    }
+    return stream;
+}
+
+// Make interruptions visible instead of silent.
+function watchTracks(stream: MediaStream): void {
+    stream.getAudioTracks().forEach(t => {
+        t.onmute = () => {
+            dlog('camera: mic track MUTED');
+            if (state.isRecording) {
+                showStatus('Something else took the microphone - this take may have no sound.', 'error', 6000);
+            }
+        };
+        t.onunmute = () => dlog('camera: mic track unmuted');
+        t.onended = () => dlog('camera: mic track ended');
+    });
+    stream.getVideoTracks().forEach(t => {
+        // Not fired when we stop() the track ourselves - only when the system
+        // takes the camera away (call, another app, lock screen).
+        t.onended = () => {
+            dlog('camera: video track ended by the system');
+            if (state.mediaStream === stream && state.isVideoMode) {
+                exitVideoMode();
+                showStatus('The camera was interrupted. Tap the camera button to turn it back on.', 'warn', 6000);
+            }
+        };
+    });
+}
+
+export function isVideoStreamLive(): boolean {
+    return !!state.mediaStream?.getVideoTracks().some(t => t.readyState === 'live');
+}
+
 export async function enterVideoMode(): Promise<void> {
+    // A previous session may have left a stream running; release it first.
+    if (state.mediaStream) {
+        state.mediaStream.getTracks().forEach(track => track.stop());
+        state.mediaStream = null;
+    }
     try {
         // Always start on the front-facing camera unless a specific camera is chosen.
         if (!state.selectedVideoDeviceId) {
             state.facingMode = 'user';
         }
-        const stream = await navigator.mediaDevices.getUserMedia(getMediaConstraints());
+        const stream = await withRecognitionPaused(() => acquireStream());
+        watchTracks(stream);
         state.mediaStream = stream;
         state.isVideoMode = true;
         state.videoLayoutMode = 'split';
@@ -84,7 +171,8 @@ export async function flipCamera(): Promise<void> {
     if (els.videoDeviceSelect) els.videoDeviceSelect.value = '';
 
     try {
-        const stream = await navigator.mediaDevices.getUserMedia(getMediaConstraints());
+        const stream = await withRecognitionPaused(() => acquireStream());
+        watchTracks(stream);
 
         // Tear down the old stream only after the new one is acquired.
         if (state.mediaStream) {
@@ -177,11 +265,13 @@ export function startRecording(): void {
 
     state.recordedChunks = [];
 
-    // Prefer MP4 with H.264 (supported in Chrome 120+, Safari)
-    // Fall back to WebM if MP4 is not available
+    // Prefer MP4 with H.264. Every entry here either names an audio codec or
+    // leaves the choice to the browser. Upstream's second choice was
+    // 'video/mp4;codecs=avc1' - video only - and since Safari can't do Opus in
+    // MP4 (the first choice), that's what Safari ended up recording with.
     const mimeTypes = [
-        'video/mp4;codecs=avc1,opus',
-        'video/mp4;codecs=avc1',
+        'video/mp4;codecs=avc1,mp4a.40.2',   // H.264 + AAC (Safari)
+        'video/mp4;codecs=avc1,opus',        // H.264 + Opus (Chrome)
         'video/mp4',
         'video/webm;codecs=vp9,opus',
         'video/webm;codecs=vp8,opus',
@@ -203,6 +293,15 @@ export function startRecording(): void {
     } catch (e) {
         state.mediaRecorder = new MediaRecorder(state.mediaStream);
     }
+
+    const mic = state.mediaStream.getAudioTracks()[0];
+    if (!mic) {
+        showStatus('No microphone in this camera stream - the recording will be silent.', 'error', 6000);
+    } else if (mic.readyState !== 'live' || mic.muted) {
+        showStatus('The microphone is busy elsewhere - this take may have no sound.', 'error', 6000);
+    }
+    dlog(`rec: start as ${state.mediaRecorder.mimeType || selectedMimeType || 'browser default'} | ` +
+        (mic ? `mic ${mic.readyState}${mic.muted ? ' MUTED' : ''}` : 'no mic track'));
 
     state.mediaRecorder.ondataavailable = (event: BlobEvent) => {
         if (event.data && event.data.size > 0) {
@@ -253,12 +352,13 @@ function downloadRecording(): void {
     const blobType = isMP4 ? 'video/mp4' : 'video/webm';
 
     const blob = new Blob(state.recordedChunks, { type: blobType });
+    dlog(`rec: saved ${(blob.size / 1048576).toFixed(1)} MB as ${actualMime || blobType}`);
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
 
     const now = new Date();
     const timestamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}`;
-    a.download = `voiceprompter-recording-${timestamp}.${extension}`;
+    a.download = `biki-prompter-${timestamp}.${extension}`;
 
     a.href = url;
     document.body.appendChild(a);

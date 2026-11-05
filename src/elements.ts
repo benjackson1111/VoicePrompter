@@ -35,6 +35,9 @@ export interface Elements {
     ipadPwaWarning: HTMLElement;
     dismissIpadWarningBtn: HTMLElement;
     langDetectionWarning: HTMLElement;
+    statusToast: HTMLElement;
+    statusToastCard: HTMLElement;
+    statusToastText: HTMLElement;
     dismissLangWarningBtn: HTMLElement;
     androidVideoWarning: HTMLElement;
     dismissAndroidVideoWarningBtn: HTMLElement;
@@ -157,6 +160,9 @@ export function initElements(): void {
         ipadPwaWarning: document.getElementById('ipadPwaWarning')!,
         dismissIpadWarningBtn: document.getElementById('dismissIpadWarningBtn')!,
         langDetectionWarning: document.getElementById('langDetectionWarning')!,
+        statusToast: document.getElementById('statusToast')!,
+        statusToastCard: document.getElementById('statusToastCard')!,
+        statusToastText: document.getElementById('statusToastText')!,
         dismissLangWarningBtn: document.getElementById('dismissLangWarningBtn')!,
         androidVideoWarning: document.getElementById('androidVideoWarning')!,
         dismissAndroidVideoWarningBtn: document.getElementById('dismissAndroidVideoWarningBtn')!,
