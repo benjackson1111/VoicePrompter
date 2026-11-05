@@ -5,13 +5,22 @@ import { withRecognitionPaused } from './speech';
 import { dlog } from './debug';
 import { showStatus } from './status';
 
-const isMobile = /iPad|iPhone|iPod|Android/i.test(navigator.userAgent)
-    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+function isMobileDevice(): boolean {
+    return /iPad|iPhone|iPod|Android/i.test(navigator.userAgent)
+        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+function isAppleMobile(): boolean {
+    return /iPad|iPhone|iPod/.test(navigator.userAgent)
+        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 // Phones and tablets should record the way they're being held. Desktop
 // webcams are landscape-only, so they always get landscape.
 function wantPortrait(): boolean {
-    return isMobile && window.matchMedia('(orientation: portrait)').matches;
+    return isMobileDevice() && window.matchMedia('(orientation: portrait)').matches;
 }
 
 // Mirror the preview only for the front ('user') camera, like a selfie view.
@@ -71,7 +80,7 @@ async function acquireStream(): Promise<MediaStream> {
     let stream = await navigator.mediaDevices.getUserMedia(getMediaConstraints(portrait));
     describeStream(stream, 'got');
 
-    if (isMobile && !state.selectedVideoDeviceId) {
+    if (isMobileDevice() && !state.selectedVideoDeviceId) {
         for (const ask of [portrait, !portrait]) {
             if (streamIsPortrait(stream) !== !portrait) break;   // right shape (or unknown)
             dlog(`camera: wrong shape for a ${portrait ? 'portrait' : 'landscape'} device, asking again`);
@@ -108,6 +117,76 @@ function watchTracks(stream: MediaStream): void {
     });
 }
 
+// Wait until the preview is showing real frames, and report their shape.
+async function previewFrameShape(timeoutMs = 1500): Promise<{ w: number; h: number }> {
+    const v = els.videoPreview;
+    if (!v.videoWidth) {
+        await new Promise<void>(resolve => {
+            const done = () => {
+                v.removeEventListener('resize', done);
+                v.removeEventListener('loadedmetadata', done);
+                clearTimeout(timer);
+                resolve();
+            };
+            const timer = setTimeout(done, timeoutMs);
+            v.addEventListener('resize', done);
+            v.addEventListener('loadedmetadata', done);
+        });
+    }
+    return { w: v.videoWidth, h: v.videoHeight };
+}
+
+async function showInPreview(stream: MediaStream): Promise<{ w: number; h: number }> {
+    els.videoPreview.srcObject = stream;
+    els.videoPreview.muted = true;
+    applyCameraMirror();
+    try {
+        await els.videoPreview.play();
+    } catch (err) {
+        dlog(`camera: preview play() failed: ${err}`);
+    }
+    const shape = await previewFrameShape();
+    dlog(`camera: preview showing ${shape.w}x${shape.h}`);
+    return shape;
+}
+
+// Start the camera and get it into the preview the right way up.
+//
+// On iPhone, a cold camera start shows a LANDSCAPE preview even though what
+// gets recorded is portrait, and turning the camera off and straight back on
+// fixed it every time. The camera reports portrait throughout, so this can't
+// be detected from the stream - only from the preview. So on iPhone we do
+// exactly what that toggle did: start it, let it run in the preview for a
+// moment, then restart it. On any phone, if the preview still isn't the shape
+// the device is being held in, restart once more.
+async function startCameraIntoPreview(): Promise<MediaStream> {
+    let stream = await acquireStream();
+    let shape = await showInPreview(stream);
+
+    const restart = async (why: string) => {
+        dlog(`camera: restarting - ${why}`);
+        stream.getTracks().forEach(t => t.stop());
+        await sleep(150);
+        stream = await acquireStream();
+        shape = await showInPreview(stream);
+    };
+
+    if (isAppleMobile() && !state.selectedVideoDeviceId) {
+        await sleep(600);   // let it run, as it did before a manual toggle
+        await restart('iPhone cold start');
+    }
+    // Only when the preview DISAGREES with what the camera says it's sending -
+    // that's the display bug. If the camera itself says it can't do this
+    // shape, acquireStream has already asked every way it can.
+    const previewPortrait = shape.h > shape.w;
+    if (isMobileDevice() && shape.w && shape.h
+        && previewPortrait !== wantPortrait()
+        && streamIsPortrait(stream) === wantPortrait()) {
+        await restart('preview disagrees with the camera');
+    }
+    return stream;
+}
+
 export function isVideoStreamLive(): boolean {
     return !!state.mediaStream?.getVideoTracks().some(t => t.readyState === 'live');
 }
@@ -123,24 +202,25 @@ export async function enterVideoMode(): Promise<void> {
         if (!state.selectedVideoDeviceId) {
             state.facingMode = 'user';
         }
-        const stream = await withRecognitionPaused(() => acquireStream());
+        state.videoLayoutMode = 'split';
+
+        // Show the video UI up front: the preview being on screen while the
+        // camera settles is part of what the manual off/on toggle did.
+        els.videoContainer.classList.remove('hidden');
+        els.videoControls.classList.remove('hidden');
+        applyVideoLayout();
+
+        const stream = await withRecognitionPaused(() => startCameraIntoPreview());
+
+        // The user may have left the prompter while the camera was starting.
+        if (els.prompterContainer.classList.contains('hidden')) {
+            stream.getTracks().forEach(t => t.stop());
+            hideVideoUI();
+            return;
+        }
         watchTracks(stream);
         state.mediaStream = stream;
         state.isVideoMode = true;
-        state.videoLayoutMode = 'split';
-
-        // Attach stream to video preview
-        els.videoPreview.srcObject = stream;
-        els.videoPreview.muted = true;
-        applyCameraMirror();
-        await els.videoPreview.play();
-
-        // Show video UI
-        els.videoContainer.classList.remove('hidden');
-        els.videoControls.classList.remove('hidden');
-
-        // Apply split layout by default
-        applyVideoLayout();
 
         setTimeout(() => {
             scrollToCurrent();
@@ -152,9 +232,17 @@ export async function enterVideoMode(): Promise<void> {
 
         (window as any).umami?.track('video-mode-enter');
     } catch (err) {
+        hideVideoUI();
         console.error('Failed to access camera:', err);
         alert('Could not access your camera. Please allow camera and microphone permissions.');
     }
+}
+
+function hideVideoUI(): void {
+    els.videoPreview.srcObject = null;
+    els.videoContainer.classList.add('hidden');
+    els.videoControls.classList.add('hidden');
+    els.prompterContainer.classList.remove('video-mode-split', 'video-mode-overlay');
 }
 
 export async function flipCamera(): Promise<void> {
@@ -171,23 +259,27 @@ export async function flipCamera(): Promise<void> {
     if (els.videoDeviceSelect) els.videoDeviceSelect.value = '';
 
     try {
-        const stream = await withRecognitionPaused(() => acquireStream());
+        const old = state.mediaStream;
+        const stream = await withRecognitionPaused(() => startCameraIntoPreview());
         watchTracks(stream);
 
-        // Tear down the old stream only after the new one is acquired.
-        if (state.mediaStream) {
-            state.mediaStream.getTracks().forEach(track => track.stop());
+        // Tear down the old stream only after the new one is showing.
+        if (old) {
+            old.getTracks().forEach(track => track.stop());
         }
         state.mediaStream = stream;
-        els.videoPreview.srcObject = stream;
-        applyCameraMirror();
-        await els.videoPreview.play();
 
         (window as any).umami?.track('video-flip-camera', { facing: state.facingMode });
     } catch (err) {
         // Device may not have the requested camera — revert.
         console.error('Failed to switch camera:', err);
         state.facingMode = previous;
+        // Put the camera we still have back in the preview.
+        if (state.mediaStream) {
+            els.videoPreview.srcObject = state.mediaStream;
+            applyCameraMirror();
+            els.videoPreview.play().catch(() => {});
+        }
         alert('Could not switch camera. This device may only have one camera.');
     }
 }
