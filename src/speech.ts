@@ -346,8 +346,10 @@ export function startListening(): void {
     consecutiveFailures = 0;
     clearTimers();
     updateMicUI(true);
-    // Reuse a healthy idle engine; replace anything that's mid-session or gone.
-    if (!state.recognition || engineRunning) createRecognizer();
+    // Always a fresh engine when the user starts listening. Reusing the engine
+    // from the previous script carried stale state from take to take on iOS -
+    // force-quitting Safari between scripts was the only thing that cleared it.
+    createRecognizer();
     engineStart();
 }
 
