@@ -117,81 +117,24 @@ function watchTracks(stream: MediaStream): void {
     });
 }
 
-// Wait until the preview is showing real frames, and report their shape.
-async function previewFrameShape(timeoutMs = 1500): Promise<{ w: number; h: number }> {
-    const v = els.videoPreview;
-    if (!v.videoWidth) {
-        await new Promise<void>(resolve => {
-            const done = () => {
-                v.removeEventListener('resize', done);
-                v.removeEventListener('loadedmetadata', done);
-                clearTimeout(timer);
-                resolve();
-            };
-            const timer = setTimeout(done, timeoutMs);
-            v.addEventListener('resize', done);
-            v.addEventListener('loadedmetadata', done);
-        });
-    }
-    return { w: v.videoWidth, h: v.videoHeight };
-}
-
-async function showInPreview(stream: MediaStream): Promise<{ w: number; h: number }> {
-    els.videoPreview.srcObject = stream;
-    els.videoPreview.muted = true;
-    applyCameraMirror();
-    try {
-        await els.videoPreview.play();
-    } catch (err) {
-        dlog(`camera: preview play() failed: ${err}`);
-    }
-    const shape = await previewFrameShape();
-    dlog(`camera: preview showing ${shape.w}x${shape.h}`);
-    return shape;
-}
-
-// Start the camera and get it into the preview the right way up.
-//
-// On iPhone, a cold camera start shows a LANDSCAPE preview even though what
-// gets recorded is portrait, and turning the camera off and straight back on
-// fixed it every time. The camera reports portrait throughout, so this can't
-// be detected from the stream - only from the preview. So on iPhone we do
-// exactly what that toggle did: start it, let it run in the preview for a
-// moment, then restart it. On any phone, if the preview still isn't the shape
-// the device is being held in, restart once more.
-async function startCameraIntoPreview(): Promise<MediaStream> {
-    let stream = await acquireStream();
-    let shape = await showInPreview(stream);
-
-    const restart = async (why: string) => {
-        dlog(`camera: restarting - ${why}`);
-        stream.getTracks().forEach(t => t.stop());
-        await sleep(150);
-        stream = await acquireStream();
-        shape = await showInPreview(stream);
-    };
-
-    if (isAppleMobile() && !state.selectedVideoDeviceId) {
-        await sleep(600);   // let it run, as it did before a manual toggle
-        await restart('iPhone cold start');
-    }
-    // Only when the preview DISAGREES with what the camera says it's sending -
-    // that's the display bug. If the camera itself says it can't do this
-    // shape, acquireStream has already asked every way it can.
-    const previewPortrait = shape.h > shape.w;
-    if (isMobileDevice() && shape.w && shape.h
-        && previewPortrait !== wantPortrait()
-        && streamIsPortrait(stream) === wantPortrait()) {
-        await restart('preview disagrees with the camera');
-    }
-    return stream;
-}
-
 export function isVideoStreamLive(): boolean {
     return !!state.mediaStream?.getVideoTracks().some(t => t.readyState === 'live');
 }
 
+// Log the preview's frame size once frames arrive (for ?debug diagnosis only;
+// nothing acts on it - iOS's numbers here don't match what's on screen).
+function logPreviewShape(label: string): void {
+    const v = els.videoPreview;
+    const report = () => dlog(`camera: ${label} preview reports ${v.videoWidth}x${v.videoHeight}`);
+    if (v.videoWidth) report();
+    else v.addEventListener('loadedmetadata', report, { once: true });
+}
+
 export async function enterVideoMode(): Promise<void> {
+    await startVideoMode(true);
+}
+
+async function startVideoMode(allowAutoToggle: boolean): Promise<void> {
     // A previous session may have left a stream running; release it first.
     if (state.mediaStream) {
         state.mediaStream.getTracks().forEach(track => track.stop());
@@ -202,25 +145,33 @@ export async function enterVideoMode(): Promise<void> {
         if (!state.selectedVideoDeviceId) {
             state.facingMode = 'user';
         }
-        state.videoLayoutMode = 'split';
-
-        // Show the video UI up front: the preview being on screen while the
-        // camera settles is part of what the manual off/on toggle did.
-        els.videoContainer.classList.remove('hidden');
-        els.videoControls.classList.remove('hidden');
-        applyVideoLayout();
-
-        const stream = await withRecognitionPaused(() => startCameraIntoPreview());
+        const stream = await withRecognitionPaused(() => acquireStream());
 
         // The user may have left the prompter while the camera was starting.
         if (els.prompterContainer.classList.contains('hidden')) {
             stream.getTracks().forEach(t => t.stop());
-            hideVideoUI();
             return;
         }
         watchTracks(stream);
         state.mediaStream = stream;
         state.isVideoMode = true;
+        state.videoLayoutMode = 'split';
+
+        // Attach while the preview is hidden, THEN show it. This order matters
+        // on iPhone: attaching to an already-visible preview locked it into
+        // landscape, even after turning the camera off and on again.
+        els.videoPreview.srcObject = stream;
+        els.videoPreview.muted = true;
+        applyCameraMirror();
+        await els.videoPreview.play();
+
+        // Show video UI
+        els.videoContainer.classList.remove('hidden');
+        els.videoControls.classList.remove('hidden');
+
+        // Apply split layout by default
+        applyVideoLayout();
+        logPreviewShape(allowAutoToggle ? 'first' : 'after auto off/on');
 
         setTimeout(() => {
             scrollToCurrent();
@@ -231,6 +182,21 @@ export async function enterVideoMode(): Promise<void> {
         }
 
         (window as any).umami?.track('video-mode-enter');
+
+        // iPhone: the first camera start shows a landscape preview, and turning
+        // the camera off and on again fixes it. So do exactly that - the same
+        // two functions the button runs, with a similar pause - once.
+        if (allowAutoToggle && isAppleMobile() && !state.selectedVideoDeviceId) {
+            await sleep(1500);
+            const stillWanted = state.isVideoMode && state.mediaStream === stream
+                && !state.isRecording && !els.prompterContainer.classList.contains('hidden');
+            if (stillWanted) {
+                dlog('camera: iPhone - turning the camera off and on again');
+                exitVideoMode();
+                await sleep(400);
+                await startVideoMode(false);
+            }
+        }
     } catch (err) {
         hideVideoUI();
         console.error('Failed to access camera:', err);
@@ -259,15 +225,18 @@ export async function flipCamera(): Promise<void> {
     if (els.videoDeviceSelect) els.videoDeviceSelect.value = '';
 
     try {
-        const old = state.mediaStream;
-        const stream = await withRecognitionPaused(() => startCameraIntoPreview());
+        const stream = await withRecognitionPaused(() => acquireStream());
         watchTracks(stream);
 
-        // Tear down the old stream only after the new one is showing.
-        if (old) {
-            old.getTracks().forEach(track => track.stop());
+        // Tear down the old stream only after the new one is acquired.
+        if (state.mediaStream) {
+            state.mediaStream.getTracks().forEach(track => track.stop());
         }
         state.mediaStream = stream;
+        els.videoPreview.srcObject = stream;
+        applyCameraMirror();
+        await els.videoPreview.play();
+        logPreviewShape('flipped');
 
         (window as any).umami?.track('video-flip-camera', { facing: state.facingMode });
     } catch (err) {
