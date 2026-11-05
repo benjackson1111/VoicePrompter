@@ -61,6 +61,11 @@ function showBrowserWarning() {
     els.browserWarning.classList.remove('hidden');
 }
 
+function isAppleMobile(): boolean {
+    return /iPad|iPhone|iPod/.test(navigator.userAgent)
+        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
 function isIPadPWA(): boolean {
     const isIPad = navigator.userAgent.includes('iPad') || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 2);
     const isPWA = (window.navigator as any).standalone === true || window.matchMedia('(display-mode: standalone)').matches;
@@ -77,6 +82,7 @@ function disposeRecognizer(): void {
     const rec = state.recognition;
     if (!rec) return;
     rec.onstart = null;
+    rec.onaudiostart = null;
     rec.onresult = null;
     rec.onerror = null;
     rec.onend = null;
@@ -94,6 +100,7 @@ function createRecognizer(): boolean {
     rec.interimResults = true;
     rec.lang = state.selectedLanguage;
     rec.onstart = handleStart;
+    rec.onaudiostart = handleAudioStart;
     rec.onresult = handleResult;
     rec.onerror = handleError;
     rec.onend = handleEnd;
@@ -170,9 +177,21 @@ function hardStop(message: string | null): void {
     dlog(`speech: stopped${message ? ' - ' + message : ''}`);
 }
 
-function handleStart(): void {
+// Any sign of life means the engine is running. Previously only the 'start'
+// event cleared the watchdog, so if Safari sent that late (or not at all) a
+// WORKING engine was thrown away every 5s even while results were arriving.
+function engineAlive(): void {
     if (startWatchdog) { clearTimeout(startWatchdog); startWatchdog = null; }
+}
+
+function handleStart(): void {
+    engineAlive();
     dlog('speech: listening');
+}
+
+function handleAudioStart(): void {
+    engineAlive();
+    dlog('speech: mic audio flowing');
 }
 
 function handleError(e: any): void {
@@ -239,6 +258,11 @@ function handleEnd(): void {
 function handleResult(event: any): void {
     if (isFirstStart) {
         gotResultOnFirstStart = true;
+    }
+    engineAlive();
+    if (!runHadResult) {
+        const last = event.results[event.results.length - 1]?.[0]?.transcript || '';
+        dlog(`speech: hearing you - "${last.trim().split(/\s+/).slice(-6).join(' ')}"`);
     }
     runHadResult = true;
     consecutiveFailures = 0;
@@ -368,14 +392,18 @@ export function stopListening(): void {
     updateMicUI(false);
 }
 
-// Run `fn` (which grabs the camera/mic) with speech recognition paused, then
-// bring recognition back on a fresh engine. Requesting the camera while
-// recognition is live makes Safari abort recognition; upstream treated that
-// abort as "stop listening for good", so the prompter went deaf the moment
-// the camera came on. Doing it in this order keeps both working.
+// Run `fn` (which grabs the camera/mic) with speech recognition paused.
+// Requesting the camera while recognition is live makes Safari abort
+// recognition; upstream treated that abort as "stop listening for good".
+//
+// Afterwards, on most devices recognition is brought back automatically on a
+// fresh engine. Not on iPhone/iPad: Ben's testing showed that once the camera
+// has the mic, an automatic restart never hears anything, but tapping the mic
+// AFTER the camera is on works every time. So there we stop listening and ask
+// for that tap. The place in the script is kept.
 export async function withRecognitionPaused<T>(fn: () => Promise<T>): Promise<T> {
-    const resume = voiceWanted();
-    if (resume) {
+    const wasListening = voiceWanted();
+    if (wasListening) {
         clearTimers();
         disposeRecognizer();
         dlog('speech: paused while the camera starts');
@@ -383,14 +411,22 @@ export async function withRecognitionPaused<T>(fn: () => Promise<T>): Promise<T>
     try {
         return await fn();
     } finally {
-        if (resume && voiceWanted()) {
-            // Let the new capture settle before speech asks for the mic.
-            await new Promise(r => setTimeout(r, 300));
-            if (voiceWanted() && !engineRunning) {
-                consecutiveFailures = 0;
-                createRecognizer();
-                engineStart();
-                dlog('speech: resumed after camera');
+        if (wasListening && voiceWanted()) {
+            if (isAppleMobile()) {
+                state.isListening = false;
+                clearTimers();
+                updateMicUI(false);
+                showStatus('Camera is on - tap the mic to start listening again.', 'warn', 6000);
+                dlog('speech: waiting for a mic tap (iOS needs it after the camera starts)');
+            } else {
+                // Let the new capture settle before speech asks for the mic.
+                await new Promise(r => setTimeout(r, 300));
+                if (voiceWanted() && !engineRunning) {
+                    consecutiveFailures = 0;
+                    createRecognizer();
+                    engineStart();
+                    dlog('speech: resumed after camera');
+                }
             }
         }
     }
