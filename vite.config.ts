@@ -15,6 +15,13 @@ export default defineConfig({
     },
     plugins: [
         VitePWA({
+            // No offline cache. Cloudflare cached sw.js (for a year), so
+            // devices that had used the app kept running an OLD build and never
+            // learned a new one existed. selfDestroying ships a sw.js that
+            // unregisters itself and deletes the old offline copy; after that
+            // every visit loads the current upload. The manifest (Add to Home
+            // Screen) is unaffected.
+            selfDestroying: true,
             registerType: 'autoUpdate',
             includeAssets: ['favicon.ico', 'apple-touch-icon.png'],
             manifest: {
