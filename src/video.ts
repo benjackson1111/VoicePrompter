@@ -24,34 +24,60 @@ function applyCameraMirror(): void {
         state.facingMode === 'user' ? 'scaleX(-1)' : 'none';
 }
 
-export function getMediaConstraints(portrait = wantPortrait()): MediaStreamConstraints {
-    // Upstream always asked for 1280x720 - landscape - so a phone held upright
-    // still got a widescreen frame.
-    const videoConstraints: any = {
-        width: { ideal: portrait ? 720 : 1280 },
-        height: { ideal: portrait ? 1280 : 720 }
-    };
-    
-    if (state.selectedVideoDeviceId) {
-        videoConstraints.deviceId = state.selectedVideoDeviceId;
-    } else {
-        videoConstraints.facingMode = state.facingMode;
-    }
+// Ways of asking the camera for a size. Every build that asked an iPhone
+// held upright for 720x1280 got a LANDSCAPE preview, every time; upstream's
+// 1280x720 started landscape but turning the camera off and on flipped it to
+// portrait. iOS evidently reads these sizes in the camera sensor's own frame,
+// and which request yields an upright portrait preview isn't something we can
+// know in advance - so on phones we try them in turn (see startCamera).
+type SizeAsk = 'portrait' | 'landscape' | 'none';
+const ASK_ORDER: SizeAsk[] = ['portrait', 'none', 'landscape', 'landscape'];
 
-    const audioConstraints: any = state.selectedAudioDeviceId
+function buildConstraints(ask: SizeAsk): MediaStreamConstraints {
+    const video: any = {};
+    if (ask === 'portrait') {
+        video.width = { ideal: 720 };
+        video.height = { ideal: 1280 };
+    } else if (ask === 'landscape') {
+        video.width = { ideal: 1280 };
+        video.height = { ideal: 720 };
+    }
+    if (state.selectedVideoDeviceId) {
+        video.deviceId = state.selectedVideoDeviceId;
+    } else {
+        video.facingMode = state.facingMode;
+    }
+    const audio: any = state.selectedAudioDeviceId
         ? { deviceId: state.selectedAudioDeviceId }
         : true;
-
-    return {
-        video: videoConstraints,
-        audio: audioConstraints
-    };
+    return { video, audio };
 }
 
-function streamIsPortrait(stream: MediaStream): boolean | null {
-    const s = stream.getVideoTracks()[0]?.getSettings();
-    if (!s || !s.width || !s.height) return null;
-    return s.height > s.width;
+export function getMediaConstraints(portrait = wantPortrait()): MediaStreamConstraints {
+    return buildConstraints(portrait ? 'portrait' : 'landscape');
+}
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+function rememberedAsk(key: string): SizeAsk | null {
+    try {
+        const v = localStorage.getItem(key);
+        return v === 'portrait' || v === 'landscape' || v === 'none' ? v : null;
+    } catch {
+        return null;
+    }
+}
+
+function rememberAsk(key: string, ask: SizeAsk): void {
+    try { localStorage.setItem(key, ask); } catch { /* private mode etc. */ }
+}
+
+// Try what worked last time first - twice, since it may have been the
+// second ask in a row that did it (as with the manual off/on) - then the rest.
+function askOrder(key: string): SizeAsk[] {
+    const last = rememberedAsk(key);
+    if (!last) return ASK_ORDER.slice();
+    return [last, last, ...ASK_ORDER.filter(a => a !== last)];
 }
 
 function describeStream(stream: MediaStream, label: string): void {
@@ -62,28 +88,76 @@ function describeStream(stream: MediaStream, label: string): void {
         (a ? `mic ${a.readyState}${a.muted ? ' MUTED' : ''}` : 'no mic track'));
 }
 
-// Get a camera+mic stream whose frame matches how the device is held.
-//
-// iOS doesn't reliably honour the requested shape on the first request
-// (turning the camera off and on again was fixing it by hand), and versions
-// differ on whether width/height are read in the screen's frame or the
-// sensor's. So check what actually came back, and if it's the wrong shape ask
-// again - first the same way, then the other way round.
-async function acquireStream(): Promise<MediaStream> {
-    const portrait = wantPortrait();
-    let stream = await navigator.mediaDevices.getUserMedia(getMediaConstraints(portrait));
-    describeStream(stream, 'got');
-
-    if (isMobileDevice() && !state.selectedVideoDeviceId) {
-        for (const ask of [portrait, !portrait]) {
-            if (streamIsPortrait(stream) !== !portrait) break;   // right shape (or unknown)
-            dlog(`camera: wrong shape for a ${portrait ? 'portrait' : 'landscape'} device, asking again`);
-            stream.getTracks().forEach(t => t.stop());
-            stream = await navigator.mediaDevices.getUserMedia(getMediaConstraints(ask));
-            describeStream(stream, 'retry');
-        }
+// Wait until the preview has real frames, and report their size.
+async function waitForFrames(timeoutMs = 1500): Promise<{ w: number; h: number }> {
+    const v = els.videoPreview;
+    if (!v.videoWidth) {
+        await new Promise<void>(resolve => {
+            const done = () => {
+                v.removeEventListener('resize', done);
+                v.removeEventListener('loadedmetadata', done);
+                clearTimeout(timer);
+                resolve();
+            };
+            const timer = setTimeout(done, timeoutMs);
+            v.addEventListener('resize', done);
+            v.addEventListener('loadedmetadata', done);
+        });
     }
-    return stream;
+    return { w: v.videoWidth, h: v.videoHeight };
+}
+
+async function attachToPreview(stream: MediaStream): Promise<{ w: number; h: number }> {
+    els.videoPreview.srcObject = stream;
+    els.videoPreview.muted = true;
+    applyCameraMirror();
+    try {
+        await els.videoPreview.play();
+    } catch (err) {
+        dlog(`camera: preview play() failed: ${err}`);
+    }
+    return waitForFrames();
+}
+
+// Start the camera and attach it to the preview, the right way up.
+//
+// On iPhone the camera's own report (getSettings) says portrait even when the
+// preview is getting landscape frames, so it can't be trusted. What the
+// preview element itself receives (videoWidth/Height) matched what was on
+// screen in every log so far, so that's what we check. On phones, try each
+// way of asking until the preview gets the right shape, and remember the
+// winner for next time. Desktop webcams just get one plain request.
+async function startCamera(): Promise<MediaStream> {
+    if (!isMobileDevice() || state.selectedVideoDeviceId) {
+        const s = await navigator.mediaDevices.getUserMedia(getMediaConstraints());
+        describeStream(s, 'got');
+        await attachToPreview(s);
+        return s;
+    }
+
+    const want = wantPortrait();
+    const key = `biki-camera-ask:${state.facingMode}:${want ? 'portrait' : 'landscape'}`;
+    const order = askOrder(key);
+    let stream: MediaStream | null = null;
+
+    for (let i = 0; i < order.length; i++) {
+        if (stream) {
+            stream.getTracks().forEach(t => t.stop());
+            await sleep(300);   // iOS is slow to hand the same camera back
+        }
+        stream = await navigator.mediaDevices.getUserMedia(buildConstraints(order[i]));
+        describeStream(stream, `try ${i + 1}/${order.length} asked ${order[i]}, camera says`);
+        const f = await attachToPreview(stream);
+        const ok = f.w > 0 && f.h > 0 && (f.h > f.w) === want;
+        dlog(`camera: try ${i + 1} -> preview gets ${f.w}x${f.h} ${ok ? 'RIGHT WAY UP' : '(wrong shape)'}`);
+        if (ok) {
+            rememberAsk(key, order[i]);
+            return stream;
+        }
+        if (!f.w) return stream;   // no frames to judge by - don't churn the camera
+    }
+    dlog('camera: no way of asking gave a right-way-up preview');
+    return stream!;
 }
 
 // Make interruptions visible instead of silent.
@@ -135,7 +209,8 @@ function watchPreview(label: string): void {
         dlog(`preview ${why} +${Math.round(performance.now() - t0)}ms: frames ${v.videoWidth}x${v.videoHeight}, box ${v.clientWidth}x${v.clientHeight}`);
     };
     dlog(`camera ${label}: ${orientationInfo()}`);
-    v.addEventListener('loadedmetadata', () => report('first'), { once: true });
+    if (v.videoWidth) report('now');
+    else v.addEventListener('loadedmetadata', () => report('first'), { once: true });
     const onResize = () => report('changed');
     v.addEventListener('resize', onResize);
     setTimeout(() => { v.removeEventListener('resize', onResize); report('at 5s'); }, 5000);
@@ -152,11 +227,13 @@ export async function enterVideoMode(): Promise<void> {
         if (!state.selectedVideoDeviceId) {
             state.facingMode = 'user';
         }
-        const stream = await withRecognitionPaused(() => acquireStream());
+        // Attached while the preview is still hidden; shown below.
+        const stream = await withRecognitionPaused(() => startCamera());
 
         // The user may have left the prompter while the camera was starting.
         if (els.prompterContainer.classList.contains('hidden')) {
             stream.getTracks().forEach(t => t.stop());
+            hideVideoUI();
             return;
         }
         watchTracks(stream);
@@ -164,14 +241,7 @@ export async function enterVideoMode(): Promise<void> {
         state.isVideoMode = true;
         state.videoLayoutMode = 'split';
 
-        // Attach while the preview is hidden, THEN show it. This order matters
-        // on iPhone: attaching to an already-visible preview locked it into
-        // landscape, even after turning the camera off and on again.
         watchPreview('on');
-        els.videoPreview.srcObject = stream;
-        els.videoPreview.muted = true;
-        applyCameraMirror();
-        await els.videoPreview.play();
 
         // Show video UI
         els.videoContainer.classList.remove('hidden');
@@ -217,18 +287,15 @@ export async function flipCamera(): Promise<void> {
     if (els.videoDeviceSelect) els.videoDeviceSelect.value = '';
 
     try {
-        const stream = await withRecognitionPaused(() => acquireStream());
+        const stream = await withRecognitionPaused(() => startCamera());
         watchTracks(stream);
 
-        // Tear down the old stream only after the new one is acquired.
+        // Tear down the old stream only after the new one is showing.
         if (state.mediaStream) {
             state.mediaStream.getTracks().forEach(track => track.stop());
         }
         state.mediaStream = stream;
         watchPreview('flipped');
-        els.videoPreview.srcObject = stream;
-        applyCameraMirror();
-        await els.videoPreview.play();
 
         (window as any).umami?.track('video-flip-camera', { facing: state.facingMode });
     } catch (err) {
